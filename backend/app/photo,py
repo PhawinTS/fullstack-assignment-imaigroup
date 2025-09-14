@@ -1,0 +1,463 @@
+# backend/models/photo.py
+from sqlalchemy import Column, Integer, String, DateTime, Text, Boolean, Float, ForeignKey, JSON
+from sqlalchemy.ext.declarative import declarative_base
+from sqlalchemy.orm import relationship
+from datetime import datetime
+from pydantic import BaseModel
+from typing import List, Optional, Dict, Any
+
+Base = declarative_base()
+
+class Photo(Base):
+    __tablename__ = "photos"
+    
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    title = Column(String(255), nullable=True)
+    original_image_url = Column(String(500), nullable=False)
+    edited_image_url = Column(String(500), nullable=True)
+    thumbnail_url = Column(String(500), nullable=True)
+    
+    # Edit state as JSON
+    edit_state = Column(JSON, nullable=True)
+    text_overlays = Column(JSON, nullable=True)
+    stickers = Column(JSON, nullable=True)
+    
+    # Metadata
+    file_size = Column(Integer, nullable=True)
+    width = Column(Integer, nullable=True)
+    height = Column(Integer, nullable=True)
+    format = Column(String(50), nullable=True)
+    
+    # Timestamps
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    
+    # Relationship
+    user = relationship("User", back_populates="photos")
+
+# Pydantic models for API
+class EditState(BaseModel):
+    brightness: int = 100
+    contrast: int = 100
+    saturation: int = 100
+    rotation: int = 0
+    flipX: bool = False
+    flipY: bool = False
+    crop: Optional[Dict[str, float]] = None
+    filter: str = "none"
+    scale: float = 1.0
+
+class TextOverlay(BaseModel):
+    id: str
+    text: str
+    x: float
+    y: float
+    fontSize: int
+    color: str
+    fontWeight: str
+
+class Sticker(BaseModel):
+    id: str
+    emoji: str
+    x: float
+    y: float
+    size: int
+    rotation: int
+
+class PhotoEditRequest(BaseModel):
+    imageData: str  # base64 encoded image
+    editState: EditState
+    textOverlays: List[TextOverlay] = []
+    stickers: List[Sticker] = []
+    title: Optional[str] = None
+
+class PhotoResponse(BaseModel):
+    id: int
+    user_id: int
+    title: Optional[str]
+    original_image_url: str
+    edited_image_url: Optional[str]
+    thumbnail_url: Optional[str]
+    edit_state: Optional[Dict[str, Any]]
+    text_overlays: Optional[List[Dict[str, Any]]]
+    stickers: Optional[List[Dict[str, Any]]]
+    width: Optional[int]
+    height: Optional[int]
+    file_size: Optional[int]
+    format: Optional[str]
+    created_at: datetime
+    updated_at: datetime
+
+class PhotoEditResponse(BaseModel):
+    success: bool
+    edited_image_url: str
+    photo_id: int
+    message: str
+
+# backend/routers/photos.py
+from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, status, BackgroundTasks
+from sqlalchemy.orm import Session
+from typing import List, Optional
+import base64
+import io
+import os
+import uuid
+from PIL import Image, ImageEnhance, ImageFilter, ImageOps
+from PIL.ImageDraw import ImageDraw
+from PIL.ImageFont import ImageFont
+import boto3
+from datetime import datetime
+import json
+
+from ..database import get_db
+from ..models.photo import Photo, PhotoEditRequest, PhotoResponse, PhotoEditResponse, EditState
+from ..auth import get_current_user
+from ..models.user import User
+
+router = APIRouter(prefix="/api/photos", tags=["photos"])
+
+# Configuration
+UPLOAD_DIR = "uploads/photos"
+ALLOWED_EXTENSIONS = {".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp"}
+MAX_FILE_SIZE = 10 * 1024 * 1024  # 10MB
+
+# AWS S3 configuration (optional)
+S3_BUCKET = os.getenv("S3_BUCKET_NAME")
+s3_client = boto3.client(
+    "s3",
+    aws_access_key_id=os.getenv("AWS_ACCESS_KEY_ID"),
+    aws_secret_access_key=os.getenv("AWS_SECRET_ACCESS_KEY"),
+    region_name=os.getenv("AWS_REGION", "us-east-1")
+) if S3_BUCKET else None
+
+def save_image_to_storage(image: Image.Image, filename: str) -> str:
+    """Save image to local storage or S3"""
+    if s3_client and S3_BUCKET:
+        # Save to S3
+        buffer = io.BytesIO()
+        image.save(buffer, format="JPEG", quality=90)
+        buffer.seek(0)
+        
+        key = f"photos/{filename}"
+        s3_client.upload_fileobj(buffer, S3_BUCKET, key)
+        return f"https://{S3_BUCKET}.s3.amazonaws.com/{key}"
+    else:
+        # Save locally
+        os.makedirs(UPLOAD_DIR, exist_ok=True)
+        filepath = os.path.join(UPLOAD_DIR, filename)
+        image.save(filepath, format="JPEG", quality=90)
+        return f"/uploads/photos/{filename}"
+
+def apply_image_edits(image: Image.Image, edit_state: EditState) -> Image.Image:
+    """Apply various image edits using PIL"""
+    # Convert to RGB if necessary
+    if image.mode != "RGB":
+        image = image.convert("RGB")
+    
+    # Apply brightness, contrast, saturation
+    if edit_state.brightness != 100:
+        enhancer = ImageEnhance.Brightness(image)
+        image = enhancer.enhance(edit_state.brightness / 100.0)
+    
+    if edit_state.contrast != 100:
+        enhancer = ImageEnhance.Contrast(image)
+        image = enhancer.enhance(edit_state.contrast / 100.0)
+    
+    if edit_state.saturation != 100:
+        enhancer = ImageEnhance.Color(image)
+        image = enhancer.enhance(edit_state.saturation / 100.0)
+    
+    # Apply rotation
+    if edit_state.rotation != 0:
+        image = image.rotate(edit_state.rotation, expand=True, fillcolor="white")
+    
+    # Apply flips
+    if edit_state.flipX:
+        image = ImageOps.mirror(image)
+    if edit_state.flipY:
+        image = ImageOps.flip(image)
+    
+    # Apply filters
+    if edit_state.filter == "vintage":
+        # Sepia effect
+        pixels = image.load()
+        width, height = image.size
+        for y in range(height):
+            for x in range(width):
+                r, g, b = pixels[x, y]
+                tr = int(0.393 * r + 0.769 * g + 0.189 * b)
+                tg = int(0.349 * r + 0.686 * g + 0.168 * b)
+                tb = int(0.272 * r + 0.534 * g + 0.131 * b)
+                pixels[x, y] = (min(255, tr), min(255, tg), min(255, tb))
+    
+    elif edit_state.filter == "bw":
+        image = ImageOps.grayscale(image).convert("RGB")
+    
+    elif edit_state.filter == "soft":
+        image = image.filter(ImageFilter.GaussianBlur(radius=0.5))
+        enhancer = ImageEnhance.Brightness(image)
+        image = enhancer.enhance(1.1)
+    
+    # Apply crop if specified
+    if edit_state.crop:
+        width, height = image.size
+        crop_box = (
+            int(edit_state.crop["x"] * width / 100),
+            int(edit_state.crop["y"] * height / 100),
+            int((edit_state.crop["x"] + edit_state.crop["width"]) * width / 100),
+            int((edit_state.crop["y"] + edit_state.crop["height"]) * height / 100)
+        )
+        image = image.crop(crop_box)
+    
+    # Apply scale
+    if edit_state.scale != 1.0:
+        width, height = image.size
+        new_width = int(width * edit_state.scale)
+        new_height = int(height * edit_state.scale)
+        image = image.resize((new_width, new_height), Image.Resampling.LANCZOS)
+    
+    return image
+
+def add_overlays_to_image(image: Image.Image, text_overlays: List[dict], stickers: List[dict]) -> Image.Image:
+    """Add text overlays and stickers to image"""
+    draw = ImageDraw(image)
+    width, height = image.size
+    
+    # Add text overlays
+    for overlay in text_overlays:
+        try:
+            font_size = overlay["fontSize"]
+            font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", font_size)
+        except:
+            font = ImageFont.load_default()
+        
+        x = int(overlay["x"] * width / 100)
+        y = int(overlay["y"] * height / 100)
+        text = overlay["text"]
+        color = overlay["color"]
+        
+        # Add text with shadow for better visibility
+        draw.text((x+1, y+1), text, font=font, fill="black")  # Shadow
+        draw.text((x, y), text, font=font, fill=color)  # Main text
+    
+    # Add stickers (for now, we'll represent them as text emojis)
+    for sticker in stickers:
+        try:
+            font_size = sticker["size"]
+            font = ImageFont.truetype("/usr/share/fonts/truetype/noto/NotoColorEmoji.ttf", font_size)
+        except:
+            font = ImageFont.load_default()
+        
+        x = int(sticker["x"])
+        y = int(sticker["y"])
+        emoji = sticker["emoji"]
+        
+        draw.text((x, y), emoji, font=font)
+    
+    return image
+
+@router.post("/upload", response_model=dict)
+async def upload_photo(
+    file: UploadFile = File(...),
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """Upload a photo file"""
+    # Validate file
+    if not file.filename:
+        raise HTTPException(status_code=400, detail="No file selected")
+    
+    file_ext = os.path.splitext(file.filename)[1].lower()
+    if file_ext not in ALLOWED_EXTENSIONS:
+        raise HTTPException(status_code=400, detail="File type not allowed")
+    
+    # Read file content
+    content = await file.read()
+    if len(content) > MAX_FILE_SIZE:
+        raise HTTPException(status_code=400, detail="File too large")
+    
+    # Process image
+    try:
+        image = Image.open(io.BytesIO(content))
+        width, height = image.size
+        
+        # Generate unique filename
+        filename = f"{uuid.uuid4()}{file_ext}"
+        image_url = save_image_to_storage(image, filename)
+        
+        # Create thumbnail
+        thumbnail = image.copy()
+        thumbnail.thumbnail((300, 300), Image.Resampling.LANCZOS)
+        thumb_filename = f"thumb_{filename}"
+        thumbnail_url = save_image_to_storage(thumbnail, thumb_filename)
+        
+        # Save to database
+        db_photo = Photo(
+            user_id=current_user.id,
+            title=file.filename,
+            original_image_url=image_url,
+            thumbnail_url=thumbnail_url,
+            width=width,
+            height=height,
+            file_size=len(content),
+            format=file_ext[1:].upper()
+        )
+        db.add(db_photo)
+        db.commit()
+        db.refresh(db_photo)
+        
+        return {
+            "success": True,
+            "imageUrl": image_url,
+            "imageId": db_photo.id,
+            "thumbnailUrl": thumbnail_url
+        }
+        
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error processing image: {str(e)}")
+
+@router.post("/edit", response_model=PhotoEditResponse)
+async def edit_photo(
+    request: PhotoEditRequest,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """Apply edits to a photo"""
+    try:
+        # Decode base64 image
+        image_data = base64.b64decode(request.imageData.split(',')[1])
+        image = Image.open(io.BytesIO(image_data))
+        
+        # Apply edits
+        edited_image = apply_image_edits(image, request.editState)
+        
+        # Add overlays
+        if request.textOverlays or request.stickers:
+            edited_image = add_overlays_to_image(
+                edited_image, 
+                [overlay.dict() for overlay in request.textOverlays],
+                [sticker.dict() for sticker in request.stickers]
+            )
+        
+        # Save edited image
+        filename = f"edited_{uuid.uuid4()}.jpg"
+        edited_url = save_image_to_storage(edited_image, filename)
+        
+        return PhotoEditResponse(
+            success=True,
+            edited_image_url=edited_url,
+            photo_id=0,  # Temporary ID
+            message="Photo edited successfully"
+        )
+        
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error editing photo: {str(e)}")
+
+@router.post("/save", response_model=PhotoResponse)
+async def save_edited_photo(
+    request: PhotoEditRequest,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """Save edited photo to database"""
+    try:
+        # Process and save the edited photo
+        edit_response = await edit_photo(request, current_user, db)
+        
+        # Create database record
+        db_photo = Photo(
+            user_id=current_user.id,
+            title=request.title or f"Edited Photo - {datetime.now().strftime('%Y-%m-%d %H:%M')}",
+            original_image_url=request.imageData[:100] + "...",  # Truncated for storage
+            edited_image_url=edit_response.edited_image_url,
+            edit_state=request.editState.dict(),
+            text_overlays=[overlay.dict() for overlay in request.textOverlays],
+            stickers=[sticker.dict() for sticker in request.stickers]
+        )
+        
+        db.add(db_photo)
+        db.commit()
+        db.refresh(db_photo)
+        
+        return PhotoResponse(
+            id=db_photo.id,
+            user_id=db_photo.user_id,
+            title=db_photo.title,
+            original_image_url=db_photo.original_image_url,
+            edited_image_url=db_photo.edited_image_url,
+            thumbnail_url=db_photo.thumbnail_url,
+            edit_state=db_photo.edit_state,
+            text_overlays=db_photo.text_overlays,
+            stickers=db_photo.stickers,
+            width=db_photo.width,
+            height=db_photo.height,
+            file_size=db_photo.file_size,
+            format=db_photo.format,
+            created_at=db_photo.created_at,
+            updated_at=db_photo.updated_at
+        )
+        
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error saving photo: {str(e)}")
+
+@router.get("/user", response_model=List[PhotoResponse])
+async def get_user_photos(
+    skip: int = 0,
+    limit: int = 50,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """Get user's saved photos"""
+    photos = db.query(Photo).filter(
+        Photo.user_id == current_user.id
+    ).offset(skip).limit(limit).all()
+    
+    return [PhotoResponse(
+        id=photo.id,
+        user_id=photo.user_id,
+        title=photo.title,
+        original_image_url=photo.original_image_url,
+        edited_image_url=photo.edited_image_url,
+        thumbnail_url=photo.thumbnail_url,
+        edit_state=photo.edit_state,
+        text_overlays=photo.text_overlays,
+        stickers=photo.stickers,
+        width=photo.width,
+        height=photo.height,
+        file_size=photo.file_size,
+        format=photo.format,
+        created_at=photo.created_at,
+        updated_at=photo.updated_at
+    ) for photo in photos]
+
+@router.delete("/{photo_id}")
+async def delete_photo(
+    photo_id: int,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """Delete a photo"""
+    photo = db.query(Photo).filter(
+        Photo.id == photo_id,
+        Photo.user_id == current_user.id
+    ).first()
+    
+    if not photo:
+        raise HTTPException(status_code=404, detail="Photo not found")
+    
+    db.delete(photo)
+    db.commit()
+    
+    return {"success": True, "message": "Photo deleted successfully"}
+
+@router.get("/filters")
+async def get_available_filters():
+    """Get available photo filters"""
+    return [
+        {"name": "None", "value": "none"},
+        {"name": "Vintage", "value": "vintage"},
+        {"name": "Black & White", "value": "bw"},
+        {"name": "Warm", "value": "warm"},
+        {"name": "Cool", "value": "cool"},
+        {"name": "Vibrant",

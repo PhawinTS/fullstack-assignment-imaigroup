@@ -1,0 +1,22 @@
+# === Docker ===
+# Local volumes / data
+docker-data/
+volumes/
+data/
+tmp/
+
+# Logs
+*.log
+
+# Build / cache
+**/.docker
+**/.dockerignore
+.docker-compose/
+docker-compose.override.yml
+
+# If using Docker Desktop / Mac
+.docker-desktop/
+
+# If using Podman or alternative runtimes
+containers/
+overlay/
